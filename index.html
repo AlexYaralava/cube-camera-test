@@ -3,45 +3,42 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Camera test</title>
+<title>Camera manual control</title>
 <style>
   body {
-    margin: 0;
-    padding: 16px;
+    margin: 0; padding: 16px;
     font-family: system-ui, sans-serif;
-    font-size: 16px;
-    line-height: 1.5;
-    background: #16181c;
-    color: #e6e6e6;
+    font-size: 16px; line-height: 1.5;
+    background: #16181c; color: #e6e6e6;
   }
   video, canvas {
-    display: block;
-    width: 100%;
-    max-width: 640px;
-    background: #000;
-    border-radius: 6px;
+    display: block; width: 100%; max-width: 640px;
+    background: #000; border-radius: 6px;
   }
   canvas { margin-top: 12px; }
   .row { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0; }
   button {
-    font: inherit;
-    padding: 10px 16px;
-    border: 1px solid #4a4f58;
-    border-radius: 6px;
-    background: #272b33;
-    color: #e6e6e6;
+    font: inherit; padding: 10px 16px;
+    border: 1px solid #4a4f58; border-radius: 6px;
+    background: #272b33; color: #e6e6e6;
   }
   button:active { background: #343a44; }
+  button[disabled] { opacity: .4; }
+  .ctl { margin: 10px 0; }
+  .ctl label {
+    display: flex; justify-content: space-between;
+    font-size: 14px; color: #b9bdc4; margin-bottom: 4px;
+  }
+  .ctl input[type=range] { width: 100%; }
+  #status { margin-top: 12px; }
+  .ok   { color: #79c07a; }
+  .bad  { color: #e08a7a; }
   #log {
     white-space: pre-wrap;
-    font-family: ui-monospace, monospace;
-    font-size: 13px;
-    background: #101216;
-    border: 1px solid #2c313a;
-    border-radius: 6px;
-    padding: 12px;
-    margin-top: 12px;
-    overflow-x: auto;
+    font-family: ui-monospace, monospace; font-size: 13px;
+    background: #101216; border: 1px solid #2c313a;
+    border-radius: 6px; padding: 12px; margin-top: 12px;
+    max-height: 320px; overflow: auto;
   }
 </style>
 </head>
@@ -49,24 +46,42 @@
 
 <div class="row">
   <button id="start">Start camera</button>
-  <button id="grab">Grab frame</button>
-  <button id="caps">Show capabilities</button>
+  <button id="lock"    disabled>Lock manual</button>
+  <button id="auto"    disabled>Back to auto</button>
+  <button id="grab"    disabled>Grab frame</button>
+  <button id="save"    disabled>Save settings</button>
 </div>
 
 <video id="preview" autoplay playsinline muted></video>
-<canvas id="work" width="1280" height="720"></canvas>
+<div id="controls"></div>
+<div id="status"></div>
+<canvas id="work"></canvas>
 <div id="log">Ready.</div>
 
 <script>
-const video  = document.getElementById('preview');
-const canvas = document.getElementById('work');
-const logEl  = document.getElementById('log');
-const ctx    = canvas.getContext('2d', { willReadFrequently: true });
+const video    = document.getElementById('preview');
+const canvas   = document.getElementById('work');
+const logEl    = document.getElementById('log');
+const ctrlsEl  = document.getElementById('controls');
+const statusEl = document.getElementById('status');
+const ctx      = canvas.getContext('2d', { willReadFrequently: true });
+
+const STORE = 'camSettings';
+const NUMERIC = ['exposureTime', 'iso', 'colorTemperature', 'focusDistance', 'zoom'];
 
 let stream = null;
+let track  = null;
+let caps   = null;
+let wakeLock = null;
 
 function log(msg) {
   logEl.textContent = String(msg) + '\n\n' + logEl.textContent;
+}
+
+function setButtons(on) {
+  for (const id of ['lock', 'auto', 'grab', 'save']) {
+    document.getElementById(id).disabled = !on;
+  }
 }
 
 async function startCamera() {
@@ -74,55 +89,193 @@ async function startCamera() {
     stream = await navigator.mediaDevices.getUserMedia({
       video: {
         facingMode: 'environment',
-        width:  { ideal: 1280 },
-        height: { ideal: 720 }
+        width:  { ideal: 1920 },
+        height: { ideal: 1080 }
       }
     });
     video.srcObject = stream;
-    const s = stream.getVideoTracks()[0].getSettings();
+    track = stream.getVideoTracks()[0];
+    caps  = track.getCapabilities ? track.getCapabilities() : {};
+
+    try { wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+
+    buildControls();
+    setButtons(true);
+
+    const s = track.getSettings();
     log('Camera running at ' + s.width + 'x' + s.height);
+
+    // A track can be reset by the system; surface it instead of hiding it
+    track.addEventListener('unmute', () => log('Track was interrupted — re-lock before scanning.'));
   } catch (err) {
     log('Could not start camera: ' + err.name + ' — ' + err.message);
   }
 }
 
+function buildControls() {
+  const saved = JSON.parse(localStorage.getItem(STORE) || '{}');
+  const now   = track.getSettings();
+  ctrlsEl.innerHTML = '';
+
+  for (const key of NUMERIC) {
+    const c = caps[key];
+    if (!c || c.max === undefined) continue;
+
+    // Some drivers report nonsense maxima (focusDistance = 2^63-1). Clamp.
+    const max  = c.max > 1e6 ? 10 : c.max;
+    const min  = c.min;
+    const step = c.step || (max - min) / 100;
+    const val  = saved[key] ?? now[key] ?? (min + (max - min) / 3);
+
+    const wrap = document.createElement('div');
+    wrap.className = 'ctl';
+    wrap.innerHTML =
+      '<label><span>' + key + '</span><span id="v-' + key + '">' + val + '</span></label>' +
+      '<input type="range" id="c-' + key + '" min="' + min + '" max="' + max +
+      '" step="' + step + '" value="' + val + '">';
+    ctrlsEl.appendChild(wrap);
+
+    const input = wrap.querySelector('input');
+    input.addEventListener('input', () => {
+      document.getElementById('v-' + key).textContent = input.value;
+    });
+    // Apply live on release so you can tune by eye
+    input.addEventListener('change', () => applyOne(key, Number(input.value)));
+  }
+}
+
+function desired() {
+  const out = {};
+  for (const key of NUMERIC) {
+    const el = document.getElementById('c-' + key);
+    if (el) out[key] = Number(el.value);
+  }
+  return out;
+}
+
+function supportsManual(mode) {
+  return Array.isArray(caps[mode]) && caps[mode].includes('manual');
+}
+
+async function applyOne(key, value) {
+  try {
+    await track.applyConstraints({ advanced: [{ [key]: value }] });
+    verify();
+  } catch (err) {
+    log('applyConstraints(' + key + ') failed: ' + err.message);
+  }
+}
+
+async function lockManual() {
+  const want = desired();
+
+  // Phase 1: switch the modes out of auto, on their own.
+  const modes = {};
+  if (supportsManual('exposureMode'))     modes.exposureMode     = 'manual';
+  if (supportsManual('whiteBalanceMode')) modes.whiteBalanceMode = 'manual';
+  if (supportsManual('focusMode'))        modes.focusMode        = 'manual';
+
+  try {
+    await track.applyConstraints({ advanced: [modes] });
+  } catch (err) {
+    log('Mode switch failed: ' + err.message);
+    return;
+  }
+
+  await new Promise(r => setTimeout(r, 300));
+
+  // Phase 2: now the numeric values will stick.
+  try {
+    await track.applyConstraints({ advanced: [want] });
+  } catch (err) {
+    log('Value apply failed: ' + err.message);
+  }
+
+  await new Promise(r => setTimeout(r, 300));
+  verify(want);
+}
+
+async function backToAuto() {
+  const modes = {};
+  if (caps.exposureMode?.includes('continuous'))     modes.exposureMode     = 'continuous';
+  if (caps.whiteBalanceMode?.includes('continuous')) modes.whiteBalanceMode = 'continuous';
+  if (caps.focusMode?.includes('continuous'))        modes.focusMode        = 'continuous';
+  try {
+    await track.applyConstraints({ advanced: [modes] });
+    await new Promise(r => setTimeout(r, 300));
+    verify();
+  } catch (err) {
+    log('Could not return to auto: ' + err.message);
+  }
+}
+
+function verify(want) {
+  const got = track.getSettings();
+  const lines = [];
+
+  for (const m of ['exposureMode', 'whiteBalanceMode', 'focusMode']) {
+    if (caps[m]) {
+      const manual = got[m] === 'manual';
+      lines.push('<div class="' + (manual ? 'ok' : 'bad') + '">' +
+                 m + ': ' + (got[m] ?? '?') + '</div>');
+    }
+  }
+
+  if (want) {
+    for (const key of Object.keys(want)) {
+      const actual = got[key];
+      // Drivers round to their own step; allow 2% drift
+      const close = actual !== undefined &&
+                    Math.abs(actual - want[key]) <= Math.max(0.02 * Math.abs(want[key]), 1e-6);
+      lines.push('<div class="' + (close ? 'ok' : 'bad') + '">' +
+                 key + ': asked ' + want[key] + ', got ' + (actual ?? 'ignored') + '</div>');
+    }
+  }
+
+  statusEl.innerHTML = lines.join('');
+  return got;
+}
+
+function saveSettings() {
+  localStorage.setItem(STORE, JSON.stringify(desired()));
+  log('Settings saved to this browser. They reload next time you open the page.');
+}
+
 function grabFrame() {
-  if (!stream) { log('Start the camera first.'); return; }
+  if (!track) return;
+
+  const got = track.getSettings();
+  if (got.whiteBalanceMode !== 'manual' || got.exposureMode !== 'manual') {
+    log('REFUSED: camera is not locked. Colours would not be comparable between shots.');
+    return;
+  }
 
   canvas.width  = video.videoWidth;
   canvas.height = video.videoHeight;
   ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-  const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
-  const d = frame.data;
-
-  // Average colour of a 40x40 patch at the centre, as a sanity check
-  const cx = (canvas.width / 2) | 0;
-  const cy = (canvas.height / 2) | 0;
+  const d  = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+  const cx = canvas.width  >> 1;
+  const cy = canvas.height >> 1;
   let r = 0, g = 0, b = 0, n = 0;
+
   for (let y = cy - 20; y < cy + 20; y++) {
     for (let x = cx - 20; x < cx + 20; x++) {
       const i = (y * canvas.width + x) * 4;
       r += d[i]; g += d[i + 1]; b += d[i + 2]; n++;
     }
   }
-  log('Centre patch RGB: ' +
-      Math.round(r / n) + ', ' +
-      Math.round(g / n) + ', ' +
-      Math.round(b / n));
-}
 
-function showCaps() {
-  if (!stream) { log('Start the camera first.'); return; }
-  const track = stream.getVideoTracks()[0];
-  const c = track.getCapabilities ? track.getCapabilities() : null;
-  if (!c) { log('getCapabilities() is not supported here.'); return; }
-  log(JSON.stringify(c, null, 2));
+  if (navigator.vibrate) navigator.vibrate(40);
+  log('Centre patch RGB: ' + Math.round(r / n) + ', ' +
+      Math.round(g / n) + ', ' + Math.round(b / n));
 }
 
 document.getElementById('start').onclick = startCamera;
+document.getElementById('lock').onclick  = lockManual;
+document.getElementById('auto').onclick  = backToAuto;
 document.getElementById('grab').onclick  = grabFrame;
-document.getElementById('caps').onclick  = showCaps;
+document.getElementById('save').onclick  = saveSettings;
 </script>
 
 </body>
