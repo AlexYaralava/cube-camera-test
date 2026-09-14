@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Camera test</title>
+<style>
+  body {
+    margin: 0;
+    padding: 16px;
+    font-family: system-ui, sans-serif;
+    font-size: 16px;
+    line-height: 1.5;
+    background: #16181c;
+    color: #e6e6e6;
+  }
+  video, canvas {
+    display: block;
+    width: 100%;
+    max-width: 640px;
+    background: #000;
+    border-radius: 6px;
+  }
+  canvas { margin-top: 12px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0; }
+  button {
+    font: inherit;
+    padding: 10px 16px;
+    border: 1px solid #4a4f58;
+    border-radius: 6px;
+    background: #272b33;
+    color: #e6e6e6;
+  }
+  button:active { background: #343a44; }
+  #log {
+    white-space: pre-wrap;
+    font-family: ui-monospace, monospace;
+    font-size: 13px;
+    background: #101216;
+    border: 1px solid #2c313a;
+    border-radius: 6px;
+    padding: 12px;
+    margin-top: 12px;
+    overflow-x: auto;
+  }
+</style>
+</head>
+<body>
+
+<div class="row">
+  <button id="start">Start camera</button>
+  <button id="grab">Grab frame</button>
+  <button id="caps">Show capabilities</button>
+</div>
+
+<video id="preview" autoplay playsinline muted></video>
+<canvas id="work" width="1280" height="720"></canvas>
+<div id="log">Ready.</div>
+
+<script>
+const video  = document.getElementById('preview');
+const canvas = document.getElementById('work');
+const logEl  = document.getElementById('log');
+const ctx    = canvas.getContext('2d', { willReadFrequently: true });
+
+let stream = null;
+
+function log(msg) {
+  logEl.textContent = String(msg) + '\n\n' + logEl.textContent;
+}
+
+async function startCamera() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: 'environment',
+        width:  { ideal: 1280 },
+        height: { ideal: 720 }
+      }
+    });
+    video.srcObject = stream;
+    const s = stream.getVideoTracks()[0].getSettings();
+    log('Camera running at ' + s.width + 'x' + s.height);
+  } catch (err) {
+    log('Could not start camera: ' + err.name + ' — ' + err.message);
+  }
+}
+
+function grabFrame() {
+  if (!stream) { log('Start the camera first.'); return; }
+
+  canvas.width  = video.videoWidth;
+  canvas.height = video.videoHeight;
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+  const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const d = frame.data;
+
+  // Average colour of a 40x40 patch at the centre, as a sanity check
+  const cx = (canvas.width / 2) | 0;
+  const cy = (canvas.height / 2) | 0;
+  let r = 0, g = 0, b = 0, n = 0;
+  for (let y = cy - 20; y < cy + 20; y++) {
+    for (let x = cx - 20; x < cx + 20; x++) {
+      const i = (y * canvas.width + x) * 4;
+      r += d[i]; g += d[i + 1]; b += d[i + 2]; n++;
+    }
+  }
+  log('Centre patch RGB: ' +
+      Math.round(r / n) + ', ' +
+      Math.round(g / n) + ', ' +
+      Math.round(b / n));
+}
+
+function showCaps() {
+  if (!stream) { log('Start the camera first.'); return; }
+  const track = stream.getVideoTracks()[0];
+  const c = track.getCapabilities ? track.getCapabilities() : null;
+  if (!c) { log('getCapabilities() is not supported here.'); return; }
+  log(JSON.stringify(c, null, 2));
+}
+
+document.getElementById('start').onclick = startCamera;
+document.getElementById('grab').onclick  = grabFrame;
+document.getElementById('caps').onclick  = showCaps;
+</script>
+
+</body>
+</html>
