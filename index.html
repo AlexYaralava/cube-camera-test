@@ -66,13 +66,28 @@ const ctrlsEl  = document.getElementById('controls');
 const statusEl = document.getElementById('status');
 const ctx      = canvas.getContext('2d', { willReadFrequently: true });
 
-const STORE = 'camSettings';
+const STORE   = 'camSettings';
 const NUMERIC = ['exposureTime', 'iso', 'colorTemperature', 'focusDistance', 'zoom'];
+
+// Sensible starting points, clamped to whatever your hardware allows.
+const PREFERRED = {
+  exposureTime:     200,
+  iso:              100,
+  colorTemperature: 5000,
+  focusDistance:    0.3,
+  zoom:             1
+};
 
 let stream = null;
 let track  = null;
 let caps   = null;
 let wakeLock = null;
+
+// "none" means the camera does no automatic adjustment at all.
+// That counts as locked, same as "manual".
+function isLocked(mode) {
+  return mode === 'manual' || mode === 'none';
+}
 
 function log(msg) {
   logEl.textContent = String(msg) + '\n\n' + logEl.textContent;
@@ -105,8 +120,8 @@ async function startCamera() {
     const s = track.getSettings();
     log('Camera running at ' + s.width + 'x' + s.height);
 
-    // A track can be reset by the system; surface it instead of hiding it
-    track.addEventListener('unmute', () => log('Track was interrupted — re-lock before scanning.'));
+    track.addEventListener('unmute', () =>
+      log('Track was interrupted — press Lock manual again before scanning.'));
   } catch (err) {
     log('Could not start camera: ' + err.name + ' — ' + err.message);
   }
@@ -114,7 +129,6 @@ async function startCamera() {
 
 function buildControls() {
   const saved = JSON.parse(localStorage.getItem(STORE) || '{}');
-  const now   = track.getSettings();
   ctrlsEl.innerHTML = '';
 
   for (const key of NUMERIC) {
@@ -125,7 +139,9 @@ function buildControls() {
     const max  = c.max > 1e6 ? 10 : c.max;
     const min  = c.min;
     const step = c.step || (max - min) / 100;
-    const val  = saved[key] ?? now[key] ?? (min + (max - min) / 3);
+
+    let val = saved[key] ?? PREFERRED[key] ?? (min + (max - min) / 3);
+    val = Math.min(max, Math.max(min, val));
 
     const wrap = document.createElement('div');
     wrap.className = 'ctl';
@@ -139,7 +155,6 @@ function buildControls() {
     input.addEventListener('input', () => {
       document.getElementById('v-' + key).textContent = input.value;
     });
-    // Apply live on release so you can tune by eye
     input.addEventListener('change', () => applyOne(key, Number(input.value)));
   }
 }
@@ -197,9 +212,13 @@ async function lockManual() {
 
 async function backToAuto() {
   const modes = {};
-  if (caps.exposureMode?.includes('continuous'))     modes.exposureMode     = 'continuous';
-  if (caps.whiteBalanceMode?.includes('continuous')) modes.whiteBalanceMode = 'continuous';
-  if (caps.focusMode?.includes('continuous'))        modes.focusMode        = 'continuous';
+  if (caps.exposureMode && caps.exposureMode.includes('continuous'))
+    modes.exposureMode = 'continuous';
+  if (caps.whiteBalanceMode && caps.whiteBalanceMode.includes('continuous'))
+    modes.whiteBalanceMode = 'continuous';
+  if (caps.focusMode && caps.focusMode.includes('continuous'))
+    modes.focusMode = 'continuous';
+
   try {
     await track.applyConstraints({ advanced: [modes] });
     await new Promise(r => setTimeout(r, 300));
@@ -215,9 +234,10 @@ function verify(want) {
 
   for (const m of ['exposureMode', 'whiteBalanceMode', 'focusMode']) {
     if (caps[m]) {
-      const manual = got[m] === 'manual';
-      lines.push('<div class="' + (manual ? 'ok' : 'bad') + '">' +
-                 m + ': ' + (got[m] ?? '?') + '</div>');
+      const locked = isLocked(got[m]);
+      lines.push('<div class="' + (locked ? 'ok' : 'bad') + '">' +
+                 m + ': ' + (got[m] === undefined ? '?' : got[m]) +
+                 (locked ? ' (locked)' : ' (auto)') + '</div>');
     }
   }
 
@@ -226,9 +246,10 @@ function verify(want) {
       const actual = got[key];
       // Drivers round to their own step; allow 2% drift
       const close = actual !== undefined &&
-                    Math.abs(actual - want[key]) <= Math.max(0.02 * Math.abs(want[key]), 1e-6);
+        Math.abs(actual - want[key]) <= Math.max(0.02 * Math.abs(want[key]), 1e-6);
       lines.push('<div class="' + (close ? 'ok' : 'bad') + '">' +
-                 key + ': asked ' + want[key] + ', got ' + (actual ?? 'ignored') + '</div>');
+                 key + ': asked ' + want[key] +
+                 ', got ' + (actual === undefined ? 'ignored' : actual) + '</div>');
     }
   }
 
@@ -238,14 +259,14 @@ function verify(want) {
 
 function saveSettings() {
   localStorage.setItem(STORE, JSON.stringify(desired()));
-  log('Settings saved to this browser. They reload next time you open the page.');
+  log('Settings saved in this browser. They reload next time you open the page.');
 }
 
 function grabFrame() {
   if (!track) return;
 
   const got = track.getSettings();
-  if (got.whiteBalanceMode !== 'manual' || got.exposureMode !== 'manual') {
+  if (!isLocked(got.whiteBalanceMode) || !isLocked(got.exposureMode)) {
     log('REFUSED: camera is not locked. Colours would not be comparable between shots.');
     return;
   }
